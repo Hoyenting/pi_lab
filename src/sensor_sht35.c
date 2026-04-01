@@ -1,8 +1,11 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include "sensor_sht35.h"
 
@@ -124,7 +127,9 @@ int sensor_init(void) {
         return -1;
     }
 
-    usleep(2000);
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 2 * 1000 * 1000};
+    nanosleep(&delay, NULL);
+
     return 0;
 #else
     errno = ENOSYS;
@@ -156,7 +161,8 @@ int sensor_read(sensor_data_t *data) {
         return -1;
     }
 
-    usleep(SHT35_MEASUREMENT_DELAY_US);
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = SHT35_MEASUREMENT_DELAY_US * 1000L};
+    nanosleep(&delay, NULL);
 
     if (read(sensor_fd, raw, sizeof(raw)) != (ssize_t)sizeof(raw)) {
         perror("Failed to read SHT35 measurement");
