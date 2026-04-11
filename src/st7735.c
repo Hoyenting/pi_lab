@@ -10,10 +10,10 @@
 
 #ifdef __linux__
 #include <fcntl.h>
+#include <gpiod.h>
 #include <linux/spi/spidev.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#include <wiringPi.h>
 
 #define ST7735_DEFAULT_SPI_DEVICE "/dev/spidev0.0"
 #define ST7735_DEFAULT_DC_PIN 24
@@ -21,11 +21,12 @@
 #define ST7735_WIDTH 128
 #define ST7735_HEIGHT 160
 #define ST7735_SPI_SPEED_HZ 8000000
+#define GPIO_CONSUMER "st7735_driver"
 
 static int spi_fd = -1;
-static int dc_pin = -1;
-static int rst_pin = -1;
-static int gpio_initialized = 0;
+static struct gpiod_chip *gpio_chip = NULL;
+static struct gpiod_line *dc_line = NULL;
+static struct gpiod_line *rst_line = NULL;
 
 static void sleep_ms(int ms) {
     struct timespec delay = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
@@ -42,19 +43,19 @@ static int spi_write(const uint8_t *data, size_t len) {
 }
 
 static int st7735_write_command(uint8_t command) {
-    digitalWrite(dc_pin, LOW);
+    gpiod_line_set_value(dc_line, 0);
     return spi_write(&command, 1);
 }
 
 static int st7735_write_data(const uint8_t *data, size_t length) {
-    digitalWrite(dc_pin, HIGH);
+    gpiod_line_set_value(dc_line, 1);
     return spi_write(data, length);
 }
 
 static int st7735_reset(void) {
-    digitalWrite(rst_pin, LOW);
+    gpiod_line_set_value(rst_line, 0);
     sleep_ms(50);
-    digitalWrite(rst_pin, HIGH);
+    gpiod_line_set_value(rst_line, 1);
     sleep_ms(150);
     return 0;
 }
@@ -194,28 +195,47 @@ int st7735_init(void) {
         device = ST7735_DEFAULT_SPI_DEVICE;
     }
 
-    dc_pin = configure_gpio_pin_from_env("ST7735_DC_PIN", ST7735_DEFAULT_DC_PIN);
-    rst_pin = configure_gpio_pin_from_env("ST7735_RST_PIN", ST7735_DEFAULT_RST_PIN);
+    int dc_pin_num = configure_gpio_pin_from_env("ST7735_DC_PIN", ST7735_DEFAULT_DC_PIN);
+    int rst_pin_num = configure_gpio_pin_from_env("ST7735_RST_PIN", ST7735_DEFAULT_RST_PIN);
 
-    /* Initialize WiringPi using GPIO pin numbers */
-    if (!gpio_initialized) {
-        if (wiringPiSetupGpio() < 0) {
-            fprintf(stderr, "Failed to initialize WiringPi\n");
-            return -1;
-        }
-        gpio_initialized = 1;
+    /* Initialize libgpiod (RPi 4 GPIO usually on gpiochip4, fallback to gpiochip0) */
+    gpio_chip = gpiod_chip_open_by_name("gpiochip4");
+    if (!gpio_chip) {
+        gpio_chip = gpiod_chip_open_by_name("gpiochip0");
     }
 
-    /* Setup GPIO pins as outputs */
-    pinMode(dc_pin, OUTPUT);
-    pinMode(rst_pin, OUTPUT);
-    digitalWrite(dc_pin, LOW);
-    digitalWrite(rst_pin, HIGH);
+    if (!gpio_chip) {
+        perror("Failed to open GPIO chip");
+        return -1;
+    }
+
+    /* Request DC pin as output */
+    dc_line = gpiod_chip_get_line(gpio_chip, dc_pin_num);
+    if (!dc_line || gpiod_line_request_output(dc_line, GPIO_CONSUMER, 0) < 0) {
+        perror("Request DC pin failed");
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        return -1;
+    }
+
+    /* Request RST pin as output */
+    rst_line = gpiod_chip_get_line(gpio_chip, rst_pin_num);
+    if (!rst_line || gpiod_line_request_output(rst_line, GPIO_CONSUMER, 1) < 0) {
+        perror("Request RST pin failed");
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        dc_line = NULL;
+        return -1;
+    }
 
     /* Open SPI device */
     spi_fd = open(device, O_RDWR);
     if (spi_fd < 0) {
         perror("Failed to open SPI device");
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        dc_line = NULL;
+        rst_line = NULL;
         return -1;
     }
 
@@ -230,6 +250,10 @@ int st7735_init(void) {
         perror("Failed to configure SPI device");
         close(spi_fd);
         spi_fd = -1;
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        dc_line = NULL;
+        rst_line = NULL;
         return -1;
     }
 
@@ -237,6 +261,10 @@ int st7735_init(void) {
     if (st7735_reset() != 0) {
         close(spi_fd);
         spi_fd = -1;
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        dc_line = NULL;
+        rst_line = NULL;
         return -1;
     }
 
@@ -273,6 +301,18 @@ int st7735_fill(uint16_t color) {
 }
 
 void st7735_cleanup(void) {
+    if (dc_line) {
+        gpiod_line_release(dc_line);
+        dc_line = NULL;
+    }
+    if (rst_line) {
+        gpiod_line_release(rst_line);
+        rst_line = NULL;
+    }
+    if (gpio_chip) {
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+    }
     if (spi_fd >= 0) {
         close(spi_fd);
         spi_fd = -1;
@@ -282,7 +322,7 @@ void st7735_cleanup(void) {
 
 int st7735_init(void) {
     errno = ENOSYS;
-    fprintf(stderr, "ST7735 support requires Linux/Raspberry Pi with WiringPi and spidev\n");
+    fprintf(stderr, "ST7735 support requires Linux/Raspberry Pi with libgpiod and spidev\n");
     return -1;
 }
 
