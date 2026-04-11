@@ -10,23 +10,22 @@
 
 #ifdef __linux__
 #include <fcntl.h>
-#include <gpiod.h>
 #include <linux/spi/spidev.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <wiringPi.h>
 
 #define ST7735_DEFAULT_SPI_DEVICE "/dev/spidev0.0"
-#define ST7735_DEFAULT_GPIOCHIP "gpiochip0"
-#define ST7735_DEFAULT_DC_LINE 24
-#define ST7735_DEFAULT_RST_LINE 25
+#define ST7735_DEFAULT_DC_PIN 24
+#define ST7735_DEFAULT_RST_PIN 25
 #define ST7735_WIDTH 128
 #define ST7735_HEIGHT 160
 #define ST7735_SPI_SPEED_HZ 8000000
 
 static int spi_fd = -1;
-static struct gpiod_chip *chip = NULL;
-static struct gpiod_line *dc_line = NULL;
-static struct gpiod_line *rst_line = NULL;
+static int dc_pin = -1;
+static int rst_pin = -1;
+static int gpio_initialized = 0;
 
 static void sleep_ms(int ms) {
     struct timespec delay = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
@@ -43,31 +42,19 @@ static int spi_write(const uint8_t *data, size_t len) {
 }
 
 static int st7735_write_command(uint8_t command) {
-    if (gpiod_line_set_value(dc_line, 0) != 0) {
-        perror("gpiod_line_set_value (DC)");
-        return -1;
-    }
+    digitalWrite(dc_pin, LOW);
     return spi_write(&command, 1);
 }
 
 static int st7735_write_data(const uint8_t *data, size_t length) {
-    if (gpiod_line_set_value(dc_line, 1) != 0) {
-        perror("gpiod_line_set_value (DC)");
-        return -1;
-    }
+    digitalWrite(dc_pin, HIGH);
     return spi_write(data, length);
 }
 
 static int st7735_reset(void) {
-    if (gpiod_line_set_value(rst_line, 0) != 0) {
-        perror("gpiod_line_set_value (RST low)");
-        return -1;
-    }
+    digitalWrite(rst_pin, LOW);
     sleep_ms(50);
-    if (gpiod_line_set_value(rst_line, 1) != 0) {
-        perror("gpiod_line_set_value (RST high)");
-        return -1;
-    }
+    digitalWrite(rst_pin, HIGH);
     sleep_ms(150);
     return 0;
 }
@@ -187,7 +174,7 @@ static int st7735_init_sequence(void) {
     return 0;
 }
 
-static int configure_gpio_line_from_env(const char *env_name, int default_value) {
+static int configure_gpio_pin_from_env(const char *env_name, int default_value) {
     const char *value = getenv(env_name);
     if (!value || *value == '\0') {
         return default_value;
@@ -207,69 +194,28 @@ int st7735_init(void) {
         device = ST7735_DEFAULT_SPI_DEVICE;
     }
 
-    const char *gpiochip = getenv("ST7735_GPIOCHIP");
-    if (!gpiochip || *gpiochip == '\0') {
-        gpiochip = ST7735_DEFAULT_GPIOCHIP;
+    dc_pin = configure_gpio_pin_from_env("ST7735_DC_PIN", ST7735_DEFAULT_DC_PIN);
+    rst_pin = configure_gpio_pin_from_env("ST7735_RST_PIN", ST7735_DEFAULT_RST_PIN);
+
+    /* Initialize WiringPi using GPIO pin numbers */
+    if (!gpio_initialized) {
+        if (wiringPiSetupGpio() < 0) {
+            fprintf(stderr, "Failed to initialize WiringPi\n");
+            return -1;
+        }
+        gpio_initialized = 1;
     }
 
-    int dc_offset = configure_gpio_line_from_env("ST7735_DC_LINE", ST7735_DEFAULT_DC_LINE);
-    int rst_offset = configure_gpio_line_from_env("ST7735_RST_LINE", ST7735_DEFAULT_RST_LINE);
-
-    /* Open GPIO chip */
-    chip = gpiod_chip_open_by_name(gpiochip);
-    if (!chip) {
-        perror("gpiod_chip_open_by_name");
-        return -1;
-    }
-
-    /* Request DC line as output */
-    dc_line = gpiod_chip_get_line(chip, dc_offset);
-    if (!dc_line) {
-        fprintf(stderr, "Failed to get DC line %d\n", dc_offset);
-        gpiod_chip_close(chip);
-        chip = NULL;
-        return -1;
-    }
-
-    if (gpiod_line_request_output(dc_line, "st7735_dc", 0) != 0) {
-        perror("gpiod_line_request_output (DC)");
-        gpiod_chip_close(chip);
-        chip = NULL;
-        dc_line = NULL;
-        return -1;
-    }
-
-    /* Request RST line as output */
-    rst_line = gpiod_chip_get_line(chip, rst_offset);
-    if (!rst_line) {
-        fprintf(stderr, "Failed to get RST line %d\n", rst_offset);
-        gpiod_line_release(dc_line);
-        gpiod_chip_close(chip);
-        chip = NULL;
-        dc_line = NULL;
-        return -1;
-    }
-
-    if (gpiod_line_request_output(rst_line, "st7735_rst", 1) != 0) {
-        perror("gpiod_line_request_output (RST)");
-        gpiod_line_release(dc_line);
-        gpiod_chip_close(chip);
-        chip = NULL;
-        dc_line = NULL;
-        rst_line = NULL;
-        return -1;
-    }
+    /* Setup GPIO pins as outputs */
+    pinMode(dc_pin, OUTPUT);
+    pinMode(rst_pin, OUTPUT);
+    digitalWrite(dc_pin, LOW);
+    digitalWrite(rst_pin, HIGH);
 
     /* Open SPI device */
     spi_fd = open(device, O_RDWR);
     if (spi_fd < 0) {
         perror("Failed to open SPI device");
-        gpiod_line_release(rst_line);
-        gpiod_line_release(dc_line);
-        gpiod_chip_close(chip);
-        chip = NULL;
-        rst_line = NULL;
-        dc_line = NULL;
         return -1;
     }
 
@@ -284,12 +230,6 @@ int st7735_init(void) {
         perror("Failed to configure SPI device");
         close(spi_fd);
         spi_fd = -1;
-        gpiod_line_release(rst_line);
-        gpiod_line_release(dc_line);
-        gpiod_chip_close(chip);
-        chip = NULL;
-        rst_line = NULL;
-        dc_line = NULL;
         return -1;
     }
 
@@ -297,12 +237,6 @@ int st7735_init(void) {
     if (st7735_reset() != 0) {
         close(spi_fd);
         spi_fd = -1;
-        gpiod_line_release(rst_line);
-        gpiod_line_release(dc_line);
-        gpiod_chip_close(chip);
-        chip = NULL;
-        rst_line = NULL;
-        dc_line = NULL;
         return -1;
     }
 
@@ -343,24 +277,12 @@ void st7735_cleanup(void) {
         close(spi_fd);
         spi_fd = -1;
     }
-    if (dc_line) {
-        gpiod_line_release(dc_line);
-        dc_line = NULL;
-    }
-    if (rst_line) {
-        gpiod_line_release(rst_line);
-        rst_line = NULL;
-    }
-    if (chip) {
-        gpiod_chip_close(chip);
-        chip = NULL;
-    }
 }
 #else
 
 int st7735_init(void) {
     errno = ENOSYS;
-    fprintf(stderr, "ST7735 support requires Linux/Raspberry Pi with libgpiod and spidev\n");
+    fprintf(stderr, "ST7735 support requires Linux/Raspberry Pi with WiringPi and spidev\n");
     return -1;
 }
 

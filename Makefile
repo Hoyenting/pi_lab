@@ -2,7 +2,7 @@
 
 CC=gcc
 CFLAGS=-std=c11 -Wall -Wextra -Iinclude
-LDLIBS=-lgpiod
+LDLIBS=-lwiringPi
 SRC=src/main.c src/sensor_sht35.c src/logger.c src/alert.c src/st7735.c
 OBJ=$(SRC:.c=.o)
 TARGET=pi_lab
