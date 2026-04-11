@@ -198,56 +198,35 @@ int st7735_init(void) {
     int rst_pin_num = configure_gpio_pin_from_env("ST7735_RST_PIN", ST7735_DEFAULT_RST_PIN);
 
     /* Open GPIO chip (try gpiochip4 first for RPi 4, fallback to gpiochip0) */
-    gpio_chip = gpiod_chip_open_by_name("gpiochip4");
+    gpio_chip = gpiod_chip_open("/dev/gpiochip4");
     if (!gpio_chip) {
-        gpio_chip = gpiod_chip_open_by_name("gpiochip0");
+        gpio_chip = gpiod_chip_open("/dev/gpiochip0");
     }
 
     if (!gpio_chip) {
-        perror("gpiod_chip_open_by_name");
+        perror("gpiod_chip_open");
         return -1;
     }
 
-    /* Create line settings for DC and RST pins */
-    struct gpiod_line_settings *settings = gpiod_line_settings_new();
-    if (!settings) {
-        perror("gpiod_line_settings_new");
+    /* Create line config */
+    struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+    if (!line_cfg) {
+        perror("gpiod_line_config_new");
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
         return -1;
     }
 
-    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
-    gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
+    /* Set DC line as output, initially inactive (LOW) */
+    unsigned int dc_lines[] = {dc_pin_num};
+    gpiod_line_config_set_direction_output(line_cfg, GPIOD_LINE_VALUE_INACTIVE);
+    gpiod_line_config_add_line_settings(line_cfg, 1, dc_lines, NULL);
 
-    /* Create request config */
-    struct gpiod_request_config *config = gpiod_request_config_new();
-    if (!config) {
-        perror("gpiod_request_config_new");
-        gpiod_line_settings_free(settings);
-        gpiod_chip_close(gpio_chip);
-        gpio_chip = NULL;
-        return -1;
-    }
-
-    gpiod_request_config_set_consumer(config, GPIO_CONSUMER);
-
-    /* Add DC pin to request */
-    if (gpiod_request_config_add_line_settings(config, dc_pin_num, settings) < 0) {
-        perror("gpiod_request_config_add_line_settings for DC");
-        gpiod_request_config_free(config);
-        gpiod_line_settings_free(settings);
-        gpiod_chip_close(gpio_chip);
-        gpio_chip = NULL;
-        return -1;
-    }
-
-    /* Configure RST pin with ACTIVE initial value */
+    /* Set RST line as output, initially active (HIGH) */
     struct gpiod_line_settings *rst_settings = gpiod_line_settings_new();
     if (!rst_settings) {
         perror("gpiod_line_settings_new for RST");
-        gpiod_request_config_free(config);
-        gpiod_line_settings_free(settings);
+        gpiod_line_config_free(line_cfg);
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
         return -1;
@@ -256,32 +235,38 @@ int st7735_init(void) {
     gpiod_line_settings_set_direction(rst_settings, GPIOD_LINE_DIRECTION_OUTPUT);
     gpiod_line_settings_set_output_value(rst_settings, GPIOD_LINE_VALUE_ACTIVE);
 
-    /* Add RST pin to request */
-    if (gpiod_request_config_add_line_settings(config, rst_pin_num, rst_settings) < 0) {
-        perror("gpiod_request_config_add_line_settings for RST");
-        gpiod_request_config_free(config);
-        gpiod_line_settings_free(settings);
+    unsigned int rst_lines[] = {rst_pin_num};
+    gpiod_line_config_add_line_settings(line_cfg, 1, rst_lines, rst_settings);
+
+    /* Create request config */
+    struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+    if (!req_cfg) {
+        perror("gpiod_request_config_new");
         gpiod_line_settings_free(rst_settings);
+        gpiod_line_config_free(line_cfg);
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
         return -1;
     }
+
+    gpiod_request_config_set_consumer(req_cfg, GPIO_CONSUMER);
+    gpiod_request_config_set_line_config(req_cfg, line_cfg);
 
     /* Request lines */
-    line_request = gpiod_chip_request_lines(gpio_chip, config, NULL);
+    line_request = gpiod_chip_request_lines(gpio_chip, req_cfg, NULL);
     if (!line_request) {
         perror("gpiod_chip_request_lines");
-        gpiod_request_config_free(config);
-        gpiod_line_settings_free(settings);
+        gpiod_request_config_free(req_cfg);
         gpiod_line_settings_free(rst_settings);
+        gpiod_line_config_free(line_cfg);
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
         return -1;
     }
 
-    gpiod_request_config_free(config);
-    gpiod_line_settings_free(settings);
+    gpiod_request_config_free(req_cfg);
     gpiod_line_settings_free(rst_settings);
+    gpiod_line_config_free(line_cfg);
 
     /* Open SPI device */
     spi_fd = open(device, O_RDWR);
