@@ -25,8 +25,7 @@
 
 static int spi_fd = -1;
 static struct gpiod_chip *gpio_chip = NULL;
-static struct gpiod_line *dc_line = NULL;
-static struct gpiod_line *rst_line = NULL;
+static struct gpiod_line_request *line_request = NULL;
 
 static void sleep_ms(int ms) {
     struct timespec delay = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
@@ -43,19 +42,19 @@ static int spi_write(const uint8_t *data, size_t len) {
 }
 
 static int st7735_write_command(uint8_t command) {
-    gpiod_line_set_value(dc_line, 0);
+    gpiod_line_request_set_value(line_request, ST7735_DEFAULT_DC_PIN, GPIOD_LINE_VALUE_INACTIVE);
     return spi_write(&command, 1);
 }
 
 static int st7735_write_data(const uint8_t *data, size_t length) {
-    gpiod_line_set_value(dc_line, 1);
+    gpiod_line_request_set_value(line_request, ST7735_DEFAULT_DC_PIN, GPIOD_LINE_VALUE_ACTIVE);
     return spi_write(data, length);
 }
 
 static int st7735_reset(void) {
-    gpiod_line_set_value(rst_line, 0);
+    gpiod_line_request_set_value(line_request, ST7735_DEFAULT_RST_PIN, GPIOD_LINE_VALUE_INACTIVE);
     sleep_ms(50);
-    gpiod_line_set_value(rst_line, 1);
+    gpiod_line_request_set_value(line_request, ST7735_DEFAULT_RST_PIN, GPIOD_LINE_VALUE_ACTIVE);
     sleep_ms(150);
     return 0;
 }
@@ -198,44 +197,100 @@ int st7735_init(void) {
     int dc_pin_num = configure_gpio_pin_from_env("ST7735_DC_PIN", ST7735_DEFAULT_DC_PIN);
     int rst_pin_num = configure_gpio_pin_from_env("ST7735_RST_PIN", ST7735_DEFAULT_RST_PIN);
 
-    /* Initialize libgpiod (RPi 4 GPIO usually on gpiochip4, fallback to gpiochip0) */
+    /* Open GPIO chip (try gpiochip4 first for RPi 4, fallback to gpiochip0) */
     gpio_chip = gpiod_chip_open_by_name("gpiochip4");
     if (!gpio_chip) {
         gpio_chip = gpiod_chip_open_by_name("gpiochip0");
     }
 
     if (!gpio_chip) {
-        perror("Failed to open GPIO chip");
+        perror("gpiod_chip_open_by_name");
         return -1;
     }
 
-    /* Request DC pin as output */
-    dc_line = gpiod_chip_get_line(gpio_chip, dc_pin_num);
-    if (!dc_line || gpiod_line_request_output(dc_line, GPIO_CONSUMER, 0) < 0) {
-        perror("Request DC pin failed");
+    /* Create line settings for DC and RST pins */
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    if (!settings) {
+        perror("gpiod_line_settings_new");
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
         return -1;
     }
 
-    /* Request RST pin as output */
-    rst_line = gpiod_chip_get_line(gpio_chip, rst_pin_num);
-    if (!rst_line || gpiod_line_request_output(rst_line, GPIO_CONSUMER, 1) < 0) {
-        perror("Request RST pin failed");
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
+
+    /* Create request config */
+    struct gpiod_request_config *config = gpiod_request_config_new();
+    if (!config) {
+        perror("gpiod_request_config_new");
+        gpiod_line_settings_free(settings);
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
-        dc_line = NULL;
         return -1;
     }
+
+    gpiod_request_config_set_consumer(config, GPIO_CONSUMER);
+
+    /* Add DC pin to request */
+    if (gpiod_request_config_add_line_settings(config, dc_pin_num, settings) < 0) {
+        perror("gpiod_request_config_add_line_settings for DC");
+        gpiod_request_config_free(config);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        return -1;
+    }
+
+    /* Configure RST pin with ACTIVE initial value */
+    struct gpiod_line_settings *rst_settings = gpiod_line_settings_new();
+    if (!rst_settings) {
+        perror("gpiod_line_settings_new for RST");
+        gpiod_request_config_free(config);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        return -1;
+    }
+
+    gpiod_line_settings_set_direction(rst_settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(rst_settings, GPIOD_LINE_VALUE_ACTIVE);
+
+    /* Add RST pin to request */
+    if (gpiod_request_config_add_line_settings(config, rst_pin_num, rst_settings) < 0) {
+        perror("gpiod_request_config_add_line_settings for RST");
+        gpiod_request_config_free(config);
+        gpiod_line_settings_free(settings);
+        gpiod_line_settings_free(rst_settings);
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        return -1;
+    }
+
+    /* Request lines */
+    line_request = gpiod_chip_request_lines(gpio_chip, config, NULL);
+    if (!line_request) {
+        perror("gpiod_chip_request_lines");
+        gpiod_request_config_free(config);
+        gpiod_line_settings_free(settings);
+        gpiod_line_settings_free(rst_settings);
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        return -1;
+    }
+
+    gpiod_request_config_free(config);
+    gpiod_line_settings_free(settings);
+    gpiod_line_settings_free(rst_settings);
 
     /* Open SPI device */
     spi_fd = open(device, O_RDWR);
     if (spi_fd < 0) {
         perror("Failed to open SPI device");
+        gpiod_line_request_release(line_request);
+        line_request = NULL;
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
-        dc_line = NULL;
-        rst_line = NULL;
         return -1;
     }
 
@@ -250,10 +305,10 @@ int st7735_init(void) {
         perror("Failed to configure SPI device");
         close(spi_fd);
         spi_fd = -1;
+        gpiod_line_request_release(line_request);
+        line_request = NULL;
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
-        dc_line = NULL;
-        rst_line = NULL;
         return -1;
     }
 
@@ -261,10 +316,10 @@ int st7735_init(void) {
     if (st7735_reset() != 0) {
         close(spi_fd);
         spi_fd = -1;
+        gpiod_line_request_release(line_request);
+        line_request = NULL;
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
-        dc_line = NULL;
-        rst_line = NULL;
         return -1;
     }
 
@@ -301,13 +356,9 @@ int st7735_fill(uint16_t color) {
 }
 
 void st7735_cleanup(void) {
-    if (dc_line) {
-        gpiod_line_release(dc_line);
-        dc_line = NULL;
-    }
-    if (rst_line) {
-        gpiod_line_release(rst_line);
-        rst_line = NULL;
+    if (line_request) {
+        gpiod_line_request_release(line_request);
+        line_request = NULL;
     }
     if (gpio_chip) {
         gpiod_chip_close(gpio_chip);
