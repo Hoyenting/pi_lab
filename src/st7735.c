@@ -2,122 +2,35 @@
 
 #include "st7735.h"
 #include <errno.h>
-#include <fcntl.h>
-#ifdef __linux__
-#include <linux/spi/spidev.h>
-#endif
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <time.h>
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <gpiod.h>
+#include <linux/spi/spidev.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #define ST7735_DEFAULT_SPI_DEVICE "/dev/spidev0.0"
-#define ST7735_DEFAULT_DC_PIN 24
-#define ST7735_DEFAULT_RST_PIN 25
-#define ST7735_DEFAULT_BL_PIN 18
+#define ST7735_DEFAULT_GPIOCHIP "gpiochip0"
+#define ST7735_DEFAULT_DC_LINE 24
+#define ST7735_DEFAULT_RST_LINE 25
 #define ST7735_WIDTH 128
 #define ST7735_HEIGHT 160
 #define ST7735_SPI_SPEED_HZ 8000000
 
 static int spi_fd = -1;
-static int dc_pin = -1;
-static int rst_pin = -1;
-static int bl_pin = -1;
+static struct gpiod_chip *chip = NULL;
+static struct gpiod_line *dc_line = NULL;
+static struct gpiod_line *rst_line = NULL;
 
 static void sleep_ms(int ms) {
     struct timespec delay = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
     nanosleep(&delay, NULL);
-}
-
-#ifdef __linux__
-
-static int gpio_write_value(int pin, int value) {
-    char path[64];
-    int fd;
-
-    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/value", pin);
-    fd = open(path, O_WRONLY);
-    if (fd < 0) {
-        perror("gpio value open");
-        return -1;
-    }
-
-    if (write(fd, value ? "1" : "0", 1) != 1) {
-        perror("gpio value write");
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    return 0;
-}
-
-static int gpio_set_direction(int pin, const char *direction) {
-    char path[64];
-    int fd;
-
-    snprintf(path, sizeof(path), "/sys/class/gpio/gpio%d/direction", pin);
-    fd = open(path, O_WRONLY);
-    if (fd < 0) {
-        perror("gpio direction open");
-        return -1;
-    }
-
-    if (write(fd, direction, strlen(direction)) != (ssize_t)strlen(direction)) {
-        perror("gpio direction write");
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    return 0;
-}
-
-static int gpio_export(int pin) {
-    char buffer[32];
-    int fd;
-
-    fd = open("/sys/class/gpio/export", O_WRONLY);
-    if (fd < 0) {
-        perror("gpio export open");
-        return -1;
-    }
-
-    int len = snprintf(buffer, sizeof(buffer), "%d", pin);
-    if (write(fd, buffer, len) != len) {
-        if (errno != EBUSY) {
-            perror("gpio export write");
-            close(fd);
-            return -1;
-        }
-    }
-
-    close(fd);
-    return 0;
-}
-
-static int gpio_unexport(int pin) {
-    char buffer[32];
-    int fd;
-
-    fd = open("/sys/class/gpio/unexport", O_WRONLY);
-    if (fd < 0) {
-        perror("gpio unexport open");
-        return -1;
-    }
-
-    int len = snprintf(buffer, sizeof(buffer), "%d", pin);
-    if (write(fd, buffer, len) != len) {
-        perror("gpio unexport write");
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    return 0;
 }
 
 static int spi_write(const uint8_t *data, size_t len) {
@@ -130,26 +43,32 @@ static int spi_write(const uint8_t *data, size_t len) {
 }
 
 static int st7735_write_command(uint8_t command) {
-    if (gpio_write_value(dc_pin, 0) != 0) {
+    if (gpiod_line_set_value(dc_line, 0) != 0) {
+        perror("gpiod_line_set_value (DC)");
         return -1;
     }
     return spi_write(&command, 1);
 }
 
 static int st7735_write_data(const uint8_t *data, size_t length) {
-    if (gpio_write_value(dc_pin, 1) != 0) {
+    if (gpiod_line_set_value(dc_line, 1) != 0) {
+        perror("gpiod_line_set_value (DC)");
         return -1;
     }
     return spi_write(data, length);
 }
 
 static int st7735_reset(void) {
-    if (rst_pin >= 0) {
-        if (gpio_write_value(rst_pin, 0) != 0) return -1;
-        sleep_ms(50);
-        if (gpio_write_value(rst_pin, 1) != 0) return -1;
-        sleep_ms(150);
+    if (gpiod_line_set_value(rst_line, 0) != 0) {
+        perror("gpiod_line_set_value (RST low)");
+        return -1;
     }
+    sleep_ms(50);
+    if (gpiod_line_set_value(rst_line, 1) != 0) {
+        perror("gpiod_line_set_value (RST high)");
+        return -1;
+    }
+    sleep_ms(150);
     return 0;
 }
 
@@ -268,7 +187,7 @@ static int st7735_init_sequence(void) {
     return 0;
 }
 
-static int configure_gpio_pin_from_env(const char *env_name, int default_value) {
+static int configure_gpio_line_from_env(const char *env_name, int default_value) {
     const char *value = getenv(env_name);
     if (!value || *value == '\0') {
         return default_value;
@@ -287,41 +206,103 @@ int st7735_init(void) {
     if (!device || *device == '\0') {
         device = ST7735_DEFAULT_SPI_DEVICE;
     }
-    dc_pin = configure_gpio_pin_from_env("ST7735_DC_PIN", ST7735_DEFAULT_DC_PIN);
-    rst_pin = configure_gpio_pin_from_env("ST7735_RST_PIN", ST7735_DEFAULT_RST_PIN);
-    bl_pin = configure_gpio_pin_from_env("ST7735_BL_PIN", ST7735_DEFAULT_BL_PIN);
 
-    if (gpio_export(dc_pin) != 0 || gpio_set_direction(dc_pin, "out") != 0) {
-        return -1;
-    }
-    if (gpio_export(rst_pin) != 0 || gpio_set_direction(rst_pin, "out") != 0) {
-        return -1;
-    }
-    if (gpio_export(bl_pin) != 0 || gpio_set_direction(bl_pin, "out") != 0) {
-        return -1;
-    }
-    if (gpio_write_value(bl_pin, 1) != 0) {
-        return -1;
+    const char *gpiochip = getenv("ST7735_GPIOCHIP");
+    if (!gpiochip || *gpiochip == '\0') {
+        gpiochip = ST7735_DEFAULT_GPIOCHIP;
     }
 
+    int dc_offset = configure_gpio_line_from_env("ST7735_DC_LINE", ST7735_DEFAULT_DC_LINE);
+    int rst_offset = configure_gpio_line_from_env("ST7735_RST_LINE", ST7735_DEFAULT_RST_LINE);
+
+    /* Open GPIO chip */
+    chip = gpiod_chip_open_by_name(gpiochip);
+    if (!chip) {
+        perror("gpiod_chip_open_by_name");
+        return -1;
+    }
+
+    /* Request DC line as output */
+    dc_line = gpiod_chip_get_line(chip, dc_offset);
+    if (!dc_line) {
+        fprintf(stderr, "Failed to get DC line %d\n", dc_offset);
+        gpiod_chip_close(chip);
+        chip = NULL;
+        return -1;
+    }
+
+    if (gpiod_line_request_output(dc_line, "st7735_dc", 0) != 0) {
+        perror("gpiod_line_request_output (DC)");
+        gpiod_chip_close(chip);
+        chip = NULL;
+        dc_line = NULL;
+        return -1;
+    }
+
+    /* Request RST line as output */
+    rst_line = gpiod_chip_get_line(chip, rst_offset);
+    if (!rst_line) {
+        fprintf(stderr, "Failed to get RST line %d\n", rst_offset);
+        gpiod_line_release(dc_line);
+        gpiod_chip_close(chip);
+        chip = NULL;
+        dc_line = NULL;
+        return -1;
+    }
+
+    if (gpiod_line_request_output(rst_line, "st7735_rst", 1) != 0) {
+        perror("gpiod_line_request_output (RST)");
+        gpiod_line_release(dc_line);
+        gpiod_chip_close(chip);
+        chip = NULL;
+        dc_line = NULL;
+        rst_line = NULL;
+        return -1;
+    }
+
+    /* Open SPI device */
     spi_fd = open(device, O_RDWR);
     if (spi_fd < 0) {
         perror("Failed to open SPI device");
+        gpiod_line_release(rst_line);
+        gpiod_line_release(dc_line);
+        gpiod_chip_close(chip);
+        chip = NULL;
+        rst_line = NULL;
+        dc_line = NULL;
         return -1;
     }
 
+    /* Configure SPI device */
     uint8_t mode = SPI_MODE_0;
     uint8_t bits = 8;
     uint32_t speed = ST7735_SPI_SPEED_HZ;
 
-    if (ioctl(spi_fd, SPI_IOC_WR_MODE, &mode) < 0 || ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 || ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
+    if (ioctl(spi_fd, SPI_IOC_WR_MODE, &mode) < 0 || 
+        ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0 || 
+        ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0) {
         perror("Failed to configure SPI device");
         close(spi_fd);
         spi_fd = -1;
+        gpiod_line_release(rst_line);
+        gpiod_line_release(dc_line);
+        gpiod_chip_close(chip);
+        chip = NULL;
+        rst_line = NULL;
+        dc_line = NULL;
         return -1;
     }
 
+    /* Reset and initialize display */
     if (st7735_reset() != 0) {
+        close(spi_fd);
+        spi_fd = -1;
+        gpiod_line_release(rst_line);
+        gpiod_line_release(dc_line);
+        gpiod_chip_close(chip);
+        chip = NULL;
+        rst_line = NULL;
+        dc_line = NULL;
         return -1;
     }
 
@@ -362,27 +343,24 @@ void st7735_cleanup(void) {
         close(spi_fd);
         spi_fd = -1;
     }
-    if (bl_pin >= 0) {
-        gpio_write_value(bl_pin, 0);
+    if (dc_line) {
+        gpiod_line_release(dc_line);
+        dc_line = NULL;
     }
-    if (dc_pin >= 0) {
-        gpio_unexport(dc_pin);
-        dc_pin = -1;
+    if (rst_line) {
+        gpiod_line_release(rst_line);
+        rst_line = NULL;
     }
-    if (rst_pin >= 0) {
-        gpio_unexport(rst_pin);
-        rst_pin = -1;
-    }
-    if (bl_pin >= 0) {
-        gpio_unexport(bl_pin);
-        bl_pin = -1;
+    if (chip) {
+        gpiod_chip_close(chip);
+        chip = NULL;
     }
 }
 #else
 
 int st7735_init(void) {
     errno = ENOSYS;
-    fprintf(stderr, "ST7735 support requires Linux/Raspberry Pi with spidev\n");
+    fprintf(stderr, "ST7735 support requires Linux/Raspberry Pi with libgpiod and spidev\n");
     return -1;
 }
 
@@ -394,4 +372,5 @@ int st7735_fill(uint16_t color) {
 
 void st7735_cleanup(void) {
 }
+
 #endif
