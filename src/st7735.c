@@ -23,9 +23,17 @@
 #define ST7735_SPI_SPEED_HZ 8000000
 #define GPIO_CONSUMER "st7735_driver"
 
+#define ST7735_PWM_CHIP_DEFAULT "/sys/class/pwm/pwmchip0"
+#define ST7735_PWM_CHANNEL_DEFAULT 2   /* GPIO18 = PWM0_CHAN2 (ALT3) on RP1 */
+#define ST7735_PWM_PERIOD_NS 1000000  /* 1 kHz */
+#define ST7735_PWM_BL_PIN_DEFAULT 18
+#define ST7735_PWM_BL_ALT_DEFAULT "a3"
+
 static int spi_fd = -1;
 static struct gpiod_chip *gpio_chip = NULL;
 static struct gpiod_line_request *line_request = NULL;
+static int pwm_enabled = 0;
+static char pwm_path_base[160]; /* e.g. /sys/class/pwm/pwmchip0/pwm0 */
 
 static void sleep_ms(int ms) {
     struct timespec delay = {.tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L};
@@ -174,6 +182,93 @@ static int st7735_init_sequence(void) {
     return 0;
 }
 
+static int pwm_write_file(const char *path, const char *value) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    ssize_t len = (ssize_t)strlen(value);
+    ssize_t n = write(fd, value, len);
+    close(fd);
+    return (n == len) ? 0 : -1;
+}
+
+int st7735_backlight_init(void) {
+    const char *chip = getenv("ST7735_PWM_CHIP");
+    if (!chip || *chip == '\0') chip = ST7735_PWM_CHIP_DEFAULT;
+
+    /* Ensure GPIO is in PWM alt-function mode.
+     * gpioset/libgpiod will silently switch the pad back to GPIO mode;
+     * this restores it so sysfs PWM actually drives the pin. */
+    {
+        const char *bl_alt = getenv("ST7735_BL_ALT");
+        if (!bl_alt || *bl_alt == '\0') bl_alt = ST7735_PWM_BL_ALT_DEFAULT;
+        int bl_pin = ST7735_PWM_BL_PIN_DEFAULT;
+        const char *bl_pin_env = getenv("ST7735_BL_PIN");
+        if (bl_pin_env && *bl_pin_env != '\0') {
+            char *end = NULL;
+            long p = strtol(bl_pin_env, &end, 10);
+            if (end != bl_pin_env && *end == '\0' && p >= 0) bl_pin = (int)p;
+        }
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "pinctrl set %d %s", bl_pin, bl_alt);
+        if (system(cmd) != 0)
+            fprintf(stderr, "Warning: '%s' failed — PWM may not drive backlight\n", cmd);
+    }
+
+    char path[200];
+    char val[32];
+
+    /* Export channel (ignore error if already exported) */
+    snprintf(path, sizeof(path), "%s/export", chip);
+    snprintf(val, sizeof(val), "%d", ST7735_PWM_CHANNEL_DEFAULT);
+    pwm_write_file(path, val);
+    sleep_ms(100);
+
+    snprintf(pwm_path_base, sizeof(pwm_path_base), "%s/pwm%d", chip, ST7735_PWM_CHANNEL_DEFAULT);
+
+    /* Set period */
+    snprintf(path, sizeof(path), "%s/period", pwm_path_base);
+    snprintf(val, sizeof(val), "%d", ST7735_PWM_PERIOD_NS);
+    if (pwm_write_file(path, val) != 0) {
+        perror("PWM set period");
+        return -1;
+    }
+
+    /* Full brightness as initial duty cycle */
+    snprintf(path, sizeof(path), "%s/duty_cycle", pwm_path_base);
+    snprintf(val, sizeof(val), "%d", ST7735_PWM_PERIOD_NS);
+    if (pwm_write_file(path, val) != 0) {
+        perror("PWM set duty_cycle");
+        return -1;
+    }
+
+    /* Enable */
+    snprintf(path, sizeof(path), "%s/enable", pwm_path_base);
+    if (pwm_write_file(path, "1") != 0) {
+        perror("PWM enable");
+        return -1;
+    }
+
+    pwm_enabled = 1;
+    return 0;
+}
+
+int st7735_set_backlight(uint8_t percent) {
+    if (!pwm_enabled) return -1;
+    if (percent > 100) percent = 100;
+
+    char path[200];
+    char val[32];
+    long duty = (long)ST7735_PWM_PERIOD_NS * percent / 100;
+
+    snprintf(path, sizeof(path), "%s/duty_cycle", pwm_path_base);
+    snprintf(val, sizeof(val), "%ld", duty);
+    if (pwm_write_file(path, val) != 0) {
+        perror("PWM set duty_cycle");
+        return -1;
+    }
+    return 0;
+}
+
 static int configure_gpio_pin_from_env(const char *env_name, int default_value) {
     const char *value = getenv(env_name);
     if (!value || *value == '\0') {
@@ -197,7 +292,7 @@ int st7735_init(void) {
     int dc_pin_num = configure_gpio_pin_from_env("ST7735_DC_PIN", ST7735_DEFAULT_DC_PIN);
     int rst_pin_num = configure_gpio_pin_from_env("ST7735_RST_PIN", ST7735_DEFAULT_RST_PIN);
 
-    /* Open GPIO chip (try gpiochip4 first for RPi 4, fallback to gpiochip0) */
+    /* Open GPIO chip (try gpiochip4 first for RPi 5, fallback to gpiochip0) */
     gpio_chip = gpiod_chip_open("/dev/gpiochip4");
     if (!gpio_chip) {
         gpio_chip = gpiod_chip_open("/dev/gpiochip0");
@@ -218,9 +313,19 @@ int st7735_init(void) {
     }
 
     /* Set DC line as output, initially inactive (LOW) */
+    struct gpiod_line_settings *dc_settings = gpiod_line_settings_new();
+    if (!dc_settings) {
+        perror("gpiod_line_settings_new for DC");
+        gpiod_line_config_free(line_cfg);
+        gpiod_chip_close(gpio_chip);
+        gpio_chip = NULL;
+        return -1;
+    }
+    gpiod_line_settings_set_direction(dc_settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(dc_settings, GPIOD_LINE_VALUE_INACTIVE);
     unsigned int dc_lines[] = {dc_pin_num};
-    gpiod_line_config_set_direction_output(line_cfg, GPIOD_LINE_VALUE_INACTIVE);
-    gpiod_line_config_add_line_settings(line_cfg, 1, dc_lines, NULL);
+    gpiod_line_config_add_line_settings(line_cfg, dc_lines, 1, dc_settings);
+    gpiod_line_settings_free(dc_settings);
 
     /* Set RST line as output, initially active (HIGH) */
     struct gpiod_line_settings *rst_settings = gpiod_line_settings_new();
@@ -231,33 +336,28 @@ int st7735_init(void) {
         gpio_chip = NULL;
         return -1;
     }
-
     gpiod_line_settings_set_direction(rst_settings, GPIOD_LINE_DIRECTION_OUTPUT);
     gpiod_line_settings_set_output_value(rst_settings, GPIOD_LINE_VALUE_ACTIVE);
-
     unsigned int rst_lines[] = {rst_pin_num};
-    gpiod_line_config_add_line_settings(line_cfg, 1, rst_lines, rst_settings);
+    gpiod_line_config_add_line_settings(line_cfg, rst_lines, 1, rst_settings);
+    gpiod_line_settings_free(rst_settings);
 
     /* Create request config */
     struct gpiod_request_config *req_cfg = gpiod_request_config_new();
     if (!req_cfg) {
         perror("gpiod_request_config_new");
-        gpiod_line_settings_free(rst_settings);
         gpiod_line_config_free(line_cfg);
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
         return -1;
     }
-
     gpiod_request_config_set_consumer(req_cfg, GPIO_CONSUMER);
-    gpiod_request_config_set_line_config(req_cfg, line_cfg);
 
     /* Request lines */
-    line_request = gpiod_chip_request_lines(gpio_chip, req_cfg, NULL);
+    line_request = gpiod_chip_request_lines(gpio_chip, req_cfg, line_cfg);
     if (!line_request) {
         perror("gpiod_chip_request_lines");
         gpiod_request_config_free(req_cfg);
-        gpiod_line_settings_free(rst_settings);
         gpiod_line_config_free(line_cfg);
         gpiod_chip_close(gpio_chip);
         gpio_chip = NULL;
@@ -265,7 +365,6 @@ int st7735_init(void) {
     }
 
     gpiod_request_config_free(req_cfg);
-    gpiod_line_settings_free(rst_settings);
     gpiod_line_config_free(line_cfg);
 
     /* Open SPI device */
@@ -341,6 +440,19 @@ int st7735_fill(uint16_t color) {
 }
 
 void st7735_cleanup(void) {
+    if (pwm_enabled) {
+        char path[200];
+        snprintf(path, sizeof(path), "%s/enable", pwm_path_base);
+        pwm_write_file(path, "0");
+
+        const char *chip = getenv("ST7735_PWM_CHIP");
+        if (!chip || *chip == '\0') chip = ST7735_PWM_CHIP_DEFAULT;
+        snprintf(path, sizeof(path), "%s/unexport", chip);
+        char val[32];
+        snprintf(val, sizeof(val), "%d", ST7735_PWM_CHANNEL_DEFAULT);
+        pwm_write_file(path, val);
+        pwm_enabled = 0;
+    }
     if (line_request) {
         gpiod_line_request_release(line_request);
         line_request = NULL;
@@ -364,6 +476,17 @@ int st7735_init(void) {
 
 int st7735_fill(uint16_t color) {
     (void)color;
+    errno = ENOSYS;
+    return -1;
+}
+
+int st7735_backlight_init(void) {
+    errno = ENOSYS;
+    return -1;
+}
+
+int st7735_set_backlight(uint8_t percent) {
+    (void)percent;
     errno = ENOSYS;
     return -1;
 }
