@@ -1,6 +1,6 @@
 # Pi Lab
 
-A Raspberry Pi environment monitor that reads temperature and humidity from a Sensirion SHT35 sensor and displays live readings on an ST7735 TFT LCD.
+A Raspberry Pi 5 environment monitor that reads temperature and humidity from a Sensirion SHT35 sensor, receives CPU temperature from a Raspberry Pi Pico 2 via UART, and displays live readings on an ST7735 TFT LCD.
 
 ## Hardware
 
@@ -9,28 +9,40 @@ A Raspberry Pi environment monitor that reads temperature and humidity from a Se
 | SHT35 temp/humidity sensor | I2C (bus 1) | `0x44` |
 | ST7735 1.8" TFT display (128×160) | SPI (`/dev/spidev0.0`) | DC: GPIO 24, RST: GPIO 25 |
 | Backlight (optional) | Hardware PWM | GPIO 18 (PWM0, `dtoverlay=pwm`) |
+| Raspberry Pi Pico 2 | UART (`/dev/ttyAMA0`) | TX: GPIO 0 → Pi GPIO 15, RX: GPIO 1 → Pi GPIO 14 |
+
+### Pico 2 wiring
+
+| Pico 2 pin | Pi 5 pin | Function |
+|------------|----------|----------|
+| Pin 1 (GP0, TX) | Pin 10 (GPIO 15, RX) | UART data |
+| Pin 2 (GP1, RX) | Pin 8 (GPIO 14, TX) | UART data |
+| Pin 38 (GND) | Pin 6 (GND) | Ground |
+| Pin 39 (VSYS) | Pin 2 (5V) | Power (optional, if not using USB) |
 
 ## Features
 
-- **Live display** — temperature and humidity refreshed every second on the ST7735
-- **Console output** — same readings printed to stdout with a timestamp
+- **Live display** — temperature, humidity, and Pico 2 CPU temperature refreshed every loop on the ST7735
+- **Console output** — readings printed to stdout with a timestamp every 20 seconds
 - **File logging** — appends to `logs/monitor.log` in the format `[YYYY-MM-DD HH:MM:SS] temp=XX.XC humidity=XX.X% status=OK`
-- **Alert** — status turns `ALERT` (red on display) when temperature exceeds 30 °C
+- **Alert** — status turns `ALERT` (red on display) when SHT35 temperature exceeds 30 °C
+- **Pico 2 CPU temp** — received via UART as `TEMP:XX.X\n`; shows `---` if unavailable
 - **Clean shutdown** — handles `SIGINT` / `SIGTERM`; clears the display before exiting
 
 ### Display layout
 
 ```
-y=  8  Temp:          (label)
-y= 26   25.3C         (large white text, scale 3)
-y= 55  Hum:           (label)
-y= 73   62.1%         (large cyan text, scale 3)
-y=102  OK             (green) / ALERT (red)
-y=124  17:28:47       (time)
-y=134  2026-05-20     (date)
+y=  2  SHT35          (label, gray)
+y= 12   25.3C         (white, scale 2)
+y= 28   62.1%         (cyan, scale 2)
+y= 50  PICO2 CPU      (label, gray)
+y= 60   45.2C         (yellow, scale 2) / --- if no data
+y= 82  OK             (green) / ALERT (red)
+y=104  17:28:47       (time, gray)
+y=114  2026-05-20     (date, gray)
 ```
 
-## Raspberry Pi setup
+## Raspberry Pi 5 setup
 
 ### I2C (SHT35)
 
@@ -51,6 +63,16 @@ Add to `/boot/firmware/config.txt`:
 dtoverlay=pwm,pin=18,func=2
 ```
 
+### UART (Pico 2)
+
+Add to `/boot/firmware/config.txt`:
+
+```
+dtoverlay=uart0-pi5
+```
+
+The Pico 2 runs `pico2/bmc_sim.c` which sends `TEMP:XX.X\n` at 115200 baud every second over UART0 (GP0/GP1). The Pi reads this on `/dev/ttyAMA0`.
+
 ## Build and run
 
 ```sh
@@ -59,6 +81,17 @@ sudo ./pi_lab
 ```
 
 `sudo` is required for GPIO and SPI access.
+
+### Pico 2 firmware
+
+```sh
+cd pico2
+mkdir build && cd build
+cmake ..
+make
+```
+
+Flash `bmc_sim.uf2` to the Pico 2 by holding BOOTSEL and copying the file to the USB mass storage device.
 
 ## Environment variables
 
@@ -71,6 +104,8 @@ sudo ./pi_lab
 | `ST7735_RST_PIN` | `25` | Reset GPIO pin |
 | `ST7735_PWM_CHIP` | `/sys/class/pwm/pwmchip0` | PWM chip path |
 | `ST7735_BL_PIN` | `18` | Backlight GPIO pin |
+| `PICO_UART_DEV` | `/dev/ttyAMA0` | Pico 2 UART device |
+| `PICO_UART_BAUD` | `115200` | Pico 2 UART baud rate |
 
 ## Project structure
 
@@ -78,14 +113,19 @@ sudo ./pi_lab
 src/
   main.c          — main loop, display update
   sensor_sht35.c  — SHT35 I2C driver
+  sensor_pico.c   — Pico 2 UART reader
   st7735.c        — ST7735 SPI driver + 5×7 bitmap font
   logger.c        — file logger
   alert.c         — threshold alert logic
 include/
   sensor_sht35.h
+  sensor_pico.h
   st7735.h
   logger.h
   alert.h
+pico2/
+  bmc_sim.c       — Pico 2 firmware (simulated BMC CPU temperature)
+  CMakeLists.txt
 logs/
   monitor.log
 scripts/
