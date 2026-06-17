@@ -1,5 +1,7 @@
 # Pi Lab — Embedded BMC Monitor
 
+[Project Presentation (PDF)](desktops/Pi-Lab.pdf)
+
 A Raspberry Pi 5 environment monitor that emulates a subset of BMC (Baseboard Management Controller) functionality: multi-sensor thermal monitoring, a Redfish-inspired REST API, an IPMI-style System Event Log, and a fan-speed simulation loop driven by a Raspberry Pi Pico 2 acting as the BMC firmware.
 
 ## Architecture
