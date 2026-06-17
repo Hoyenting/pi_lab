@@ -1,8 +1,8 @@
 #!/bin/bash
 
-PI_USER="tingpi"
-PI_HOST="100.103.61.6"
-PI_DIR="~/pi_lab"
+MAC_USER="hoting"
+MAC_HOST="100.102.179.21"
+MAC_DIR="~/pi_lab"
 
 rsync -av --delete \
   --exclude ".git" \
@@ -10,4 +10,4 @@ rsync -av --delete \
   --exclude "*.o" \
   --exclude "*.out" \
   --exclude ".DS_Store" \
-  ./ "${PI_USER}@${PI_HOST}:${PI_DIR}/"
+  ./ "${MAC_USER}@${MAC_HOST}:${MAC_DIR}/"
