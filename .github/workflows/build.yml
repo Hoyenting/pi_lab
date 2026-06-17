@@ -1,0 +1,24 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgpiod-dev
+
+      - name: Build
+        run: make build
+
+      - name: Build test binaries
+        run: |
+          make test_st7735
+          make test_pico2
