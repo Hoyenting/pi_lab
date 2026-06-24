@@ -110,9 +110,9 @@ int pico_sensor_init(const char *device, int baud) {
 #endif
 }
 
-int pico_sensor_read(float *temp_c) {
+int pico_sensor_read(pico_data_t *data) {
 #ifdef __linux__
-    if (!temp_c) {
+    if (!data) {
         errno = EINVAL;
         return -1;
     }
@@ -126,15 +126,21 @@ int pico_sensor_read(float *temp_c) {
     if (read_line(line, sizeof(line)) != 0)
         return -1;
 
-    if (sscanf(line, "TEMP:%f", temp_c) != 1) {
-        errno = EBADMSG;
-        fprintf(stderr, "pico_sensor_read(): unexpected line: \"%s\"\n", line);
-        return -1;
+    /* Extended format: BMC:TEMP:XX.X,FAN:XXXX */
+    if (sscanf(line, "BMC:TEMP:%f,FAN:%d", &data->cpu_temp_c, &data->fan_rpm) == 2)
+        return 0;
+
+    /* Legacy format: TEMP:XX.X */
+    if (sscanf(line, "TEMP:%f", &data->cpu_temp_c) == 1) {
+        data->fan_rpm = 0;
+        return 0;
     }
 
-    return 0;
+    errno = EBADMSG;
+    fprintf(stderr, "pico_sensor_read(): unexpected line: \"%s\"\n", line);
+    return -1;
 #else
-    (void)temp_c;
+    (void)data;
     errno = ENOSYS;
     return -1;
 #endif

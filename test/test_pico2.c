@@ -17,11 +17,12 @@ int main(int argc, char *argv[]) {
 
     int ok = 0;
     for (int i = 0; i < READ_COUNT; i++) {
-        float temp;
-        if (pico_sensor_read(&temp) != 0) {
+        pico_data_t d;
+        if (pico_sensor_read(&d) != 0) {
             fprintf(stderr, "Read %d failed\n", i + 1);
         } else {
-            printf("[%d] CPU temp: %.1f °C\n", i + 1, temp);
+            printf("[%d] CPU temp: %.1f °C  fan: %d RPM\n",
+                   i + 1, d.cpu_temp_c, d.fan_rpm);
             ok++;
         }
     }

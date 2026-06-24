@@ -6,3 +6,4 @@ test/test_st7735
 test/test_pico2
 logs/
 pico2/build/
+pico2/wifi_config.h
