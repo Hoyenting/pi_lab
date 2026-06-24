@@ -8,26 +8,26 @@ A Raspberry Pi 5 environment monitor that emulates a subset of BMC (Baseboard Ma
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                   Raspberry Pi 5  (Host OS)                   │
+│                   Raspberry Pi 5  (Host OS)                  │
 │                                                              │
-│  ┌─────────────┐  ┌────────────────┐  ┌──────────────────┐  │
-│  │  SHT35      │  │  ST7735 TFT    │  │  Redfish HTTP    │  │
-│  │  I2C driver │  │  SPI driver    │  │  API  (:8080)    │  │
-│  └──────┬──────┘  └───────┬────────┘  └────────┬─────────┘  │
+│  ┌─────────────┐  ┌────────────────┐  ┌──────────────────┐   │
+│  │  SHT35      │  │  ST7735 TFT    │  │  Redfish HTTP    │   │
+│  │  I2C driver │  │  SPI driver    │  │  API  (:8080)    │   │
+│  └──────┬──────┘  └───────┬────────┘  └────────┬─────────┘   │
 │         │                 │                     │            │
 │  ┌──────▼─────────────────▼─────────────────────▼─────────┐  │
-│  │                    Main monitor loop                    │  │
+│  │                    Main monitor loop                   │  │
 │  │   alert_check()  →  SEL  →  logger  →  display_update  │  │
-│  └─────────────────────────────────────────────────────────┘  │
+│  └────────────────────────────────────────────────────────┘  │
 └────────────────────────────┬─────────────────────────────────┘
                              │ UART 115200 baud
 ┌────────────────────────────▼─────────────────────────────────┐
-│              Raspberry Pi Pico 2  (BMC Simulator)             │
+│              Raspberry Pi Pico 2  (BMC Simulator)            │
 │                                                              │
 │   ADC → on-chip temp sensor                                  │
 │   Fan curve: linear RPM ∝ temperature (800–4000 RPM)         │
 │   PWM → GP2 (open-loop fan tachometer signal)                │
-│   UART TX: "BMC:TEMP:XX.X,FAN:XXXX\n" every 1 s             │
+│   UART TX: "BMC:TEMP:XX.X,FAN:XXXX\n" every 1 s              │
 └──────────────────────────────────────────────────────────────┘
 ```
 
